@@ -1,0 +1,201 @@
+name: expo-ios-debug
+version: "1.0"
+description: >
+  Expo / React Native の iOS アプリ開発におけるデバッグガイド。
+  パッケージバージョン不一致によるビルドエラー、TestFlight 配布後の
+  画面真っ黒問題、スプラッシュ画面フリーズを体系的に診断・修正する。
+tags:
+  - expo
+  - react-native
+  - ios
+  - xcode
+  - testflight
+  - debug
+
+trigger_conditions:
+  - Expo SDK アップグレード後のビルドエラー
+  - iOS 実機・TestFlight で画面が真っ黒
+  - スプラッシュ画面がフリーズ・表示されない
+  - Swift シンボル not found エラー
+  - Xcode Cloud / EAS Build のビルド失敗
+
+diagnosis_flow:
+  start: build_error?
+  nodes:
+    build_error?:
+      question: ビルドエラーが出ているか？
+      yes: pattern_1_version_mismatch
+      no: splash_visible?
+    splash_visible?:
+      question: スプラッシュ画面は表示されるか？
+      no: pattern_3_splash_screen
+      yes: pattern_2_app_delegate
+
+patterns:
+
+  - id: pattern_1_version_mismatch
+    name: パッケージバージョン不一致によるビルドエラー
+    symptoms:
+      - "error: use of undeclared type 'ExpoAppDelegate'"
+      - "error: cannot find 'RCTAppDelegate' in scope"
+      - "error: no such module 'ExpoModulesCore'"
+      - Xcode Cloud / EAS Build でコンパイルエラー
+    root_cause: >
+      Expo SDK のバージョンと各 native パッケージのバージョンが合っていない。
+      SDK アップグレード後に `npx expo install --fix` を実行しないと発生しやすい。
+    investigation:
+      steps:
+        - name: 現在の Expo SDK バージョンを確認
+          command: "cat package.json | grep '\"expo\"'"
+        - name: bundledNativeModules で正しいバージョンを確認
+          command: "cat node_modules/expo/bundledNativeModules.json | grep -E 'file-system|splash-screen|camera'"
+        - name: 実際にインストールされているバージョンと比較
+          command: "cat node_modules/expo-file-system/package.json | grep '\"version\"'"
+    fix:
+      primary:
+        description: expo install --fix で一括自動修正
+        command: "npx expo install --fix"
+      fallback:
+        description: 個別にインストール
+        command: "npx expo install expo-file-system expo-splash-screen"
+    version_table:
+      description: Expo SDK バージョン別 主要パッケージ対応表
+      columns: [expo_sdk, expo-file-system, expo-splash-screen, expo-camera]
+      rows:
+        - [54, "~19.0.21", "~31.0.13", "~16.0.18"]
+        - [53, "~18.0.12", "~30.0.x",  "~15.0.x"]
+        - [52, "~17.0.x",  "~29.0.x",  "~14.0.x"]
+
+  - id: pattern_2_app_delegate
+    name: AppDelegate の継承問題（画面真っ黒）
+    symptoms:
+      - ビルド成功・TestFlight インストール成功・アプリ起動で画面が真っ黒
+      - スプラッシュ画面は一瞬表示された後に黒画面
+      - React Native のコンソールログが一切出ない
+    root_cause: >
+      Expo SDK 54 から EXAppDelegateWrapper の継承先が変わった。
+      SDK 53 以前: EXAppDelegateWrapper → RCTAppDelegate → NSObject（RN ウィンドウ生成コードが走る）
+      SDK 54 以降: EXAppDelegateWrapper → NSObject 直接（RN ウィンドウ生成コードが走らない）
+      prebuild --clean をせずにアップグレードすると古い AppDelegate が残り発症する。
+    investigation:
+      steps:
+        - name: AppDelegate の継承クラスを確認
+          command: "cat ios/<APP_NAME>/AppDelegate.swift"
+        - name: EXAppDelegateWrapper の実際の継承先を確認
+          command: "cat node_modules/expo-modules-core/ios/AppDelegates/EXAppDelegateWrapper.h"
+    fix:
+      description: >
+        AppDelegate.swift の継承を EXAppDelegateWrapper から RCTAppDelegate に変更し、
+        moduleName・initialProps・bundleURL を明示的に設定する。
+      swift:
+        before: |
+          @UIApplicationMain
+          class AppDelegate: EXAppDelegateWrapper {
+            override func application(
+              _ application: UIApplication,
+              didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+            ) -> Bool {
+              return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+            }
+          }
+        after: |
+          @UIApplicationMain
+          class AppDelegate: RCTAppDelegate {
+            override func application(
+              _ application: UIApplication,
+              didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+            ) -> Bool {
+              self.moduleName = "main"
+              self.initialProps = [:]
+              return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+            }
+
+            override func sourceURL(for bridge: RCTBridge) -> URL? {
+              return self.bundleURL()
+            }
+
+            override func bundleURL() -> URL? {
+              #if DEBUG
+              return RCTBundleURLProvider.sharedSettings().jsBundleURL(
+                forBundleRoot: ".expo/.virtual-metro-entry"
+              )
+              #else
+              return Bundle.main.url(forResource: "main", withExtension: "jsbundle")
+              #endif
+            }
+          }
+      objc:
+        before: "@interface AppDelegate : EXAppDelegateWrapper"
+        after:  "@interface AppDelegate : RCTAppDelegate"
+
+  - id: pattern_3_splash_screen
+    name: expo-splash-screen 未インストール／設定不備
+    symptoms:
+      - スプラッシュ画面が表示されない
+      - 白画面・黒画面のままフリーズ
+    root_cause: >
+      expo-splash-screen がインストールされていない、または
+      app.json の splash 設定が不足している。
+    investigation:
+      steps:
+        - name: インストール確認
+          command: "cat package.json | grep 'splash-screen'"
+        - name: app.json の設定確認
+          command: "cat app.json | grep -A5 '\"splash\"'"
+    fix:
+      install:
+        command: "npx expo install expo-splash-screen"
+      app_json: |
+        {
+          "expo": {
+            "splash": {
+              "image": "./assets/splash.png",
+              "resizeMode": "contain",
+              "backgroundColor": "#ffffff"
+            }
+          }
+        }
+
+testflight_checklist:
+  note: TestFlight でのみ発生する問題は「リリースビルド限定のバグ」が多い
+  items:
+    - ビルドスキームが Release になっているか
+    - API エンドポイントが本番環境を指しているか
+    - expo-updates の設定が正しいか（runtimeVersion など）
+    - AppDelegate の継承が正しいか（パターン2参照）
+    - __DEV__ フラグに依存したコードがないか
+    - Metro bundler の設定が本番用になっているか
+  debug_logging:
+    description: リリースビルドでもログを出す方法（AppDelegate.swift に追加）
+    code: |
+      override func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+      ) -> Bool {
+        print("AppDelegate: didFinishLaunching called")
+        let result = super.application(application, didFinishLaunchingWithOptions: launchOptions)
+        print("AppDelegate: super returned \(result), window = \(String(describing: self.window))")
+        return result
+      }
+
+sdk_upgrade_procedure:
+  steps:
+    - order: 1
+      name: Expo SDK 更新
+      command: "npm install expo@latest"
+    - order: 2
+      name: 関連パッケージを一括更新
+      command: "npx expo install --fix"
+    - order: 3
+      name: iOS ネイティブの再生成
+      command: "npx expo prebuild --clean"
+    - order: 4
+      name: pod install
+      command: "cd ios && pod install && cd .."
+    - order: 5
+      name: リリースビルド確認
+      command: "npx expo run:ios --configuration Release"
+  common_pitfalls:
+    - npx expo install --fix をしないと bundledNativeModules.json と実際のバージョンがずれる
+    - prebuild --clean をしないと古い AppDelegate が残り継承問題が発生する
+    - pod install をスキップすると Swift シンボルが見つからないエラーが出る
